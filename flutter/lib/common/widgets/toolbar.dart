@@ -739,7 +739,8 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
   // to-do:
   // 1. Web desktop
   // 2. Mobile, copy the image to the clipboard
-  if ((isDefaultConn || ffi.connType == ConnType.viewCamera) && isDesktop) {
+  if ((isDefaultConn || ffi.connType == ConnType.viewCamera) &&
+      (isDesktop || isOhosDesktop)) {
     final isScreenshotSupported = bind.sessionGetCommonSync(
         sessionId: sessionId, key: 'is_screenshot_supported', param: '');
     if ('true' == isScreenshotSupported) {
@@ -878,7 +879,7 @@ Future<List<TRadioMenu<String>>> toolbarCodec(
   final sessionId = ffi.sessionId;
   final alternativeCodecs =
       await bind.sessionAlternativeCodecs(sessionId: sessionId);
-  final groupValue = await bind.sessionGetOption(
+  final rawGroupValue = await bind.sessionGetOption(
           sessionId: sessionId, arg: kOptionCodecPreference) ??
       '';
   final List<bool> codecs = [];
@@ -901,6 +902,16 @@ Future<List<TRadioMenu<String>>> toolbarCodec(
     return _registerRadioMenuShortcuts<String>(ffi, [],
         ownedActionIds: _kToolbarCodecActionIds);
   }
+  final availableValues = <String>{
+    'auto',
+    'vp9',
+    if (codecs[0]) 'vp8',
+    if (codecs[1]) 'av1',
+    if (codecs[2]) 'h264',
+    if (codecs[3]) 'h265',
+  };
+  final groupValue =
+      availableValues.contains(rawGroupValue) ? rawGroupValue : 'auto';
   onChanged(String? value) async {
     if (value == null) return;
     await bind.sessionPeerOption(

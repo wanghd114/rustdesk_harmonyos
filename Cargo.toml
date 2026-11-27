@@ -73,7 +73,7 @@ libsamplerate-sys = { version = "0.1.12", optional = true }
 uuid = { version = "1.3", features = ["v4"] }
 num_cpus = "1.15"
 bytes = { version = "1.4", features = ["serde"] }
-default-net = "0.14"
+default-net = { git = "https://github.com/rustdesk-org/netdev", branch = "rustdesk-0.22" }
 wol-rs = "1.0"
 flutter_rust_bridge = { version = "=1.80", features = ["uuid"], optional = true}
 errno = "0.3"
@@ -308,6 +308,9 @@ name = "RustDesk"
 identifier = "com.carriez.rustdesk"
 icon = ["res/32x32.png", "res/128x128.png", "res/128x128@2x.png"]
 osx_minimum_system_version = "10.14"
+# View Camera needs NSCameraUsageDescription or macOS kills the process at the
+# camera permission prompt; the Flutter bundle gets it via its own Info.plist.
+osx_info_plist_exts = ["res/osx_camera_info.plist"]
 
 #https://github.com/johnthagen/min-sized-rust
 [profile.release]

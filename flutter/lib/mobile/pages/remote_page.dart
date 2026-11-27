@@ -17,12 +17,15 @@ import 'package:provider/provider.dart';
 import '../../common.dart';
 import '../../common/widgets/overlay.dart';
 import '../../common/widgets/dialog.dart';
+import '../../common/widgets/ohos_video_texture.dart';
 import '../../common/widgets/remote_input.dart';
 import '../../models/input_model.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../../models/shortcut_model.dart';
 import '../../utils/image.dart';
+import '../../utils/ohos_ime.dart';
+import '../../utils/ohos_session_window.dart';
 import '../widgets/dialog.dart';
 import '../widgets/custom_scale_widget.dart';
 
@@ -93,6 +96,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   bool _showGestureHelp = false;
   String _value = '';
   Orientation? _currentOrientation;
+  Size? _lastOhosWindowSize;
+  bool? _ohosLandscapeMultiWindow;
   final _uniqueKey = UniqueKey();
   Timer? _iosKeyboardWorkaroundTimer;
 
@@ -131,6 +136,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       forceRelay: widget.forceRelay,
     );
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (isOhos && mounted) {
+        _lastOhosWindowSize = MediaQuery.maybeOf(context)?.size;
+      }
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: []);
       gFFI.dialogManager
           .showLoading(translate('Connecting...'), onCancel: closeConnection);
@@ -142,6 +150,13 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     gFFI.qualityMonitorModel.checkShowQualityMonitor(sessionId);
     keyboardSubscription =
         keyboardVisibilityController.onChange.listen(onSoftKeyboardChanged);
+    if (isOhos) {
+      _mobileFocusNode.addListener(_onOhosSoftKeyboardFocusChanged);
+      ohosMiniWindow.addListener(_onOhosMiniWindowChanged);
+      gFFI.ffiModel.addListener(_syncOhosLandscapeMultiWindow);
+      gFFI.canvasModel.addListener(_syncOhosLandscapeMultiWindow);
+      _syncOhosLandscapeMultiWindow();
+    }
     gFFI.chatModel
         .changeCurrentKey(MessageKey(widget.id, ChatModel.clientModeID));
     _blockableOverlayState.applyFfi(gFFI);
@@ -185,35 +200,51 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   }
 
   @override
-  Future<void> dispose() async {
+  void dispose() {
     HardwareKeyboard.instance.removeHandler(_handleLocalKeyEvent);
-    WidgetsBinding.instance.removeObserver(this);
-    // Close the session up-front. `gFFI.close()` below only calls `sessionClose`
-    // after several awaits (canvas save, image update, the `enable_soft_keyboard`
-    // platform call), so if the app is backgrounded while this page is disposing,
-    // dispose can be suspended before reaching it and the connection is never torn
-    // down. The reconnect then re-attaches to the leaked session and is stuck on
-    // "Connecting...". Dispatching it here makes teardown happen synchronously on
-    // pop; the `sessionClose` in `gFFI.close()` becomes a no-op once removed.
-    unawaited(bind.sessionClose(sessionId: sessionId));
-    // https://github.com/flutter/flutter/issues/64935
+    if (isOhos) {
+      _mobileFocusNode.removeListener(_onOhosSoftKeyboardFocusChanged);
+      ohosMiniWindow.removeListener(_onOhosMiniWindowChanged);
+      gFFI.ffiModel.removeListener(_syncOhosLandscapeMultiWindow);
+      gFFI.canvasModel.removeListener(_syncOhosLandscapeMultiWindow);
+      unawaited(platformFFI.setLandscapeMultiWindow(false));
+    } else {
+      unawaited(bind.sessionClose(sessionId: sessionId));
+    }
     super.dispose();
-    gFFI.dialogManager.hideMobileActionsOverlay(store: false);
-    gFFI.inputModel.listenToMouse(false);
-    gFFI.imageModel.disposeImage();
-    gFFI.cursorModel.disposeImages();
-    await gFFI.invokeMethod("enable_soft_keyboard", true);
+    final closing = _disposeSession();
+    if (isOhos) {
+      OhosSessionWindow.trackDisposal(closing);
+    }
+    unawaited(closing);
+  }
+
+  Future<void> _disposeSession() async {
+    WidgetsBinding.instance.removeObserver(this);
+    final ffi = gFFI;
+    final sessionId = ffi.sessionId;
+    // Register the complete FFI close before the first await. A new mobile
+    // connection joins it instead of reusing the UUID during native teardown.
+    final closing = ffi.close();
+    ffi.dialogManager.hideMobileActionsOverlay(store: false);
+    ffi.inputModel.listenToMouse(false);
+    ffi.imageModel.disposeImage();
+    ffi.cursorModel.disposeImages();
+    ffi.dialogManager.dismissAll();
+    ffi.inputModel.keyboardInputAllowed = true;
+    _timer?.cancel();
+    _iosKeyboardWorkaroundTimer?.cancel();
+    removeSharedStates(widget.id);
+    await ffi.invokeMethod("enable_soft_keyboard", true);
     _mobileFocusNode.dispose();
     _physicalFocusNode.dispose();
     clearWaylandKeyboardPromptSuppressedForConnection(sessionId.toString());
     _waylandKeyboardGateWorker?.dispose();
-    inputModel.keyboardInputAllowed = true;
-    await gFFI.close();
-    _timer?.cancel();
-    _iosKeyboardWorkaroundTimer?.cancel();
-    gFFI.dialogManager.dismissAll();
-    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
-        overlays: SystemUiOverlay.values);
+    await closing;
+    if (!isOhos) {
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
+          overlays: SystemUiOverlay.values);
+    }
     WakelockManager.disable(_uniqueKey);
     await keyboardSubscription.cancel();
     removeSharedStates(widget.id);
@@ -227,7 +258,93 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       trySyncClipboard();
+      _disableOhosImePreviewText();
     }
+  }
+
+  @override
+  void didChangeMetrics() {
+    if (!isOhos || !mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      // Only rescale when the window itself resizes (mini-window / rotation /
+      // split-screen). Soft-keyboard inset changes are owned by
+      // saveMobileOffsetBeforeSoftKeyboard / restoreMobileOffsetAfterSoftKeyboard;
+      // rescaling on keyboard insets shifts the canvas before the pre-keyboard
+      // offset is saved and leaves the picture stuck upward after dismissal.
+      final windowSize = MediaQuery.maybeOf(context)?.size;
+      if (windowSize == null || windowSize == _lastOhosWindowSize) {
+        return;
+      }
+      _lastOhosWindowSize = windowSize;
+      gFFI.canvasModel.rescaleForViewportChange();
+    });
+  }
+
+  void _syncOhosLandscapeMultiWindow() {
+    if (!isOhos || !mounted) return;
+    final rect = gFFI.ffiModel.rect;
+    if (rect == null || rect.width <= 0 || rect.height <= 0) return;
+    final enabled = rect.width > rect.height;
+    if (_ohosLandscapeMultiWindow == enabled) return;
+    _ohosLandscapeMultiWindow = enabled;
+    unawaited(platformFFI.setLandscapeMultiWindow(enabled));
+  }
+
+  void _onOhosMiniWindowChanged() {
+    if (!mounted) return;
+    if (ohosMiniWindow.value) {
+      if (_showEdit) {
+        _showEdit = false;
+        gFFI.invokeMethod("enable_soft_keyboard", false);
+        _mobileFocusNode.unfocus();
+        _physicalFocusNode.requestFocus();
+      }
+      _showGestureHelp = false;
+    }
+    setState(() {});
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _lastOhosWindowSize = MediaQuery.maybeOf(context)?.size;
+      gFFI.canvasModel.rescaleForViewportChange();
+    });
+  }
+
+  /// On HarmonyOS the soft-keyboard session follows the focus of its text
+  /// field: Flutter-OH attaches the input method when the field takes the
+  /// focus, and closes the input connection and unfocuses the field when the
+  /// user dismisses the input method.
+  void _onOhosSoftKeyboardFocusChanged() {
+    if (!isOhos || !mounted) return;
+    if (_mobileFocusNode.hasFocus) {
+      _disableOhosImePreviewText();
+      return;
+    }
+    if (!_showEdit) return;
+    // Unless something else took the focus, it fell back to the scope around
+    // the field, where no key reaches the remote.
+    final dismissed =
+        FocusManager.instance.primaryFocus == _mobileFocusNode.enclosingScope;
+    setState(() => _showEdit = false);
+    if (dismissed) {
+      gFFI.invokeMethod("enable_soft_keyboard", false);
+      _physicalFocusNode.requestFocus();
+    }
+  }
+
+  /// Flutter-OH turns the input method's text preview back on every time it
+  /// attaches the soft-keyboard field: when the field takes the focus and when
+  /// the window is active again. The preview arrives as ordinary text, so the
+  /// Pinyin still being composed would be typed on the remote.
+  void _disableOhosImePreviewText() {
+    if (!isOhos) return;
+    // Runs after the field's own focus handler, so that the request follows
+    // the attach it corrects.
+    Timer.run(() {
+      if (!mounted || !_mobileFocusNode.hasFocus) return;
+      platformFFI.disableImePreviewText().catchError((error) =>
+          debugPrint('Failed to disable the OHOS IME text preview: $error'));
+    });
   }
 
   // For client side
@@ -284,6 +401,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       );
 
   void onSoftKeyboardChanged(bool visible) {
+    if (isOhos) {
+      // HarmonyOS only reports a docked keyboard, not a floating one or the
+      // candidate bar of a hardware keyboard. Showing the system bars for the
+      // keyboard, as below, would leave them up, and the bottom bar lifted by
+      // the navigation indicator, whenever no "hidden" event follows. So the
+      // visibility only lays out the page here; the focus of the text field
+      // ends the soft-keyboard session.
+      if (mounted) setState(() {});
+      return;
+    }
     if (!visible) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: []);
       // [pi.version.isNotEmpty] -> check ready or not, avoid login without soft-keyboard
@@ -422,8 +549,31 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     }
     if (isIOS) {
       _handleIOSSoftKeyboardInput(newValue);
+    } else if (isOhos) {
+      _handleOhosSoftKeyboardInput(newValue);
     } else {
       _handleNonIOSSoftKeyboardInput(newValue);
+    }
+  }
+
+  /// A HarmonyOS input method replaces text it sent earlier, which the
+  /// length-only diff answers with a single backspace.
+  void _handleOhosSoftKeyboardInput(String newValue) {
+    final diff = softKeyboardCommitDiff(_value, newValue);
+    if (diff.backspaces == 0 && diff.text.isEmpty) {
+      return;
+    }
+    _value = newValue;
+    for (var i = 0; i < diff.backspaces; ++i) {
+      inputModel.inputKey('VK_BACK');
+    }
+    if (diff.text.isEmpty) {
+      return;
+    }
+    if (diff.text.length > 1) {
+      bind.sessionInputString(sessionId: sessionId, value: diff.text);
+    } else {
+      inputChar(diff.text);
     }
   }
 
@@ -440,6 +590,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   }
 
   void openKeyboard() {
+    if (isOhos && _showEdit && _mobileFocusNode.hasFocus) {
+      // A floating keyboard and the candidate bar of a hardware keyboard are
+      // not reported as a visible keyboard, so nothing else offers to dismiss
+      // them.
+      setState(() => _showEdit = false);
+      gFFI.invokeMethod("enable_soft_keyboard", false);
+      _mobileFocusNode.unfocus();
+      _physicalFocusNode.requestFocus();
+      return;
+    }
     final allowWaylandKeyboard =
         mainGetPeerBoolOptionSync(widget.id, kPeerOptionAllowWaylandKeyboard);
     if (shouldShowWaylandKeyboardPrompt(
@@ -475,8 +635,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       setState(() => _showEdit = true);
       _timer?.cancel();
       _timer = Timer(kMobileDelaySoftKeyboardFocus, () {
-        SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
-            overlays: SystemUiOverlay.values);
+        // HarmonyOS keeps the system bars hidden, see onSoftKeyboardChanged.
+        if (!isOhos) {
+          SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
+              overlays: SystemUiOverlay.values);
+        }
         _mobileFocusNode.requestFocus();
       });
     });
@@ -490,9 +653,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    final miniWindow = isOhos && ohosMiniWindow.value;
     final keyboardIsVisible =
-        keyboardVisibilityController.isVisible && _showEdit;
-    final showActionButton = !_showBar || keyboardIsVisible || _showGestureHelp;
+        !miniWindow && keyboardVisibilityController.isVisible && _showEdit;
+    final showActionButton =
+        !miniWindow && (!_showBar || keyboardIsVisible || _showGestureHelp);
 
     return WillPopScope(
       onWillPop: () async {
@@ -529,56 +694,73 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                       }
                     });
                   }),
-          bottomNavigationBar: Obx(() => Stack(
-                alignment: Alignment.bottomCenter,
-                children: [
-                  gFFI.ffiModel.pi.isSet.isTrue &&
-                          gFFI.ffiModel.waitForFirstImage.isTrue
-                      ? emptyOverlay(MyTheme.canvasColor)
-                      : () {
-                          gFFI.ffiModel.tryShowAndroidActionsOverlay();
-                          return Offstage();
-                        }(),
-                  _bottomWidget(),
-                  gFFI.ffiModel.pi.isSet.isFalse
-                      ? emptyOverlay(MyTheme.canvasColor)
-                      : Offstage(),
+          bottomNavigationBar: miniWindow
+              ? const SizedBox.shrink()
+              : Obx(() => gFFI.ffiModel.pi.isSet.isTrue
+                  ? _bottomWidget()
+                  : const SizedBox.shrink()),
+          body: Obx(
+            () => Stack(fit: StackFit.expand, children: [
+              getRawPointerAndKeyBody(Overlay(
+                initialEntries: [
+                  OverlayEntry(builder: (context) {
+                    return ValueListenableBuilder<bool>(
+                      valueListenable: ohosMiniWindow,
+                      builder: (context, isMini, child) {
+                        final trimSafeArea = isOhos && isMini;
+                        return Container(
+                          color: kColorCanvas,
+                          child: isWebDesktop
+                              ? getBodyForDesktopWithListener()
+                              : SafeArea(
+                                  left: !trimSafeArea,
+                                  top: !trimSafeArea,
+                                  right: !trimSafeArea,
+                                  bottom: !trimSafeArea,
+                                  child: child!,
+                                ),
+                        );
+                      },
+                      child: OrientationBuilder(builder: (ctx, orientation) {
+                        if (_currentOrientation != orientation) {
+                          Timer(const Duration(milliseconds: 200), () {
+                            if (!mounted) return;
+                            gFFI.dialogManager
+                                .resetMobileActionsOverlay(ffi: gFFI);
+                            _currentOrientation = orientation;
+                            if (isOhos) {
+                              gFFI.canvasModel.rescaleForViewportChange();
+                            } else {
+                              gFFI.canvasModel.updateViewStyle();
+                            }
+                          });
+                        }
+                        return Container(
+                          color: MyTheme.canvasColor,
+                          child: inputModel.isPhysicalMouse.value
+                              ? getBodyForMobile()
+                              : RawTouchGestureDetectorRegion(
+                                  child: getBodyForMobile(),
+                                  ffi: gFFI,
+                                ),
+                        );
+                      }),
+                    );
+                  })
                 ],
               )),
-          body: Obx(
-            () => getRawPointerAndKeyBody(Overlay(
-              initialEntries: [
-                OverlayEntry(builder: (context) {
-                  return Container(
-                    color: kColorCanvas,
-                    child: isWebDesktop
-                        ? getBodyForDesktopWithListener()
-                        : SafeArea(
-                            child:
-                                OrientationBuilder(builder: (ctx, orientation) {
-                              if (_currentOrientation != orientation) {
-                                Timer(const Duration(milliseconds: 200), () {
-                                  gFFI.dialogManager
-                                      .resetMobileActionsOverlay(ffi: gFFI);
-                                  _currentOrientation = orientation;
-                                  gFFI.canvasModel.updateViewStyle();
-                                });
-                              }
-                              return Container(
-                                color: MyTheme.canvasColor,
-                                child: inputModel.isPhysicalMouse.value
-                                    ? getBodyForMobile()
-                                    : RawTouchGestureDetectorRegion(
-                                        child: getBodyForMobile(),
-                                        ffi: gFFI,
-                                      ),
-                              );
-                            }),
-                          ),
-                  );
-                })
-              ],
-            )),
+              // A waiting screen must cover the viewport, not reserve its
+              // height as a bottom bar: native first-image readiness requires
+              // the Texture underneath to receive a real paint first.
+              if (gFFI.ffiModel.pi.isSet.isFalse ||
+                  gFFI.ffiModel.waitForFirstImage.isTrue)
+                Positioned.fill(child: emptyOverlay(MyTheme.canvasColor))
+              else
+                () {
+                  gFFI.ffiModel.tryShowAndroidActionsOverlay();
+                  return const SizedBox.shrink();
+                }(),
+            ]),
           )),
     );
   }
@@ -711,7 +893,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         color: MyTheme.canvasColor,
         child: Stack(children: () {
           final paints = [
-            ImagePaint(ffiModel: gFFI.ffiModel),
+            // HarmonyOS shows the decoder's own Surface through this texture
+            // and keeps the picture here for everything else.
+            OhosVideoTextureLayer(
+              ffi: gFFI,
+              picture: ImagePaint(ffiModel: gFFI.ffiModel),
+            ),
             Positioned(
               top: 10,
               right: 10,

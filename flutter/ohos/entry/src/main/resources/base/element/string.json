@@ -1,0 +1,28 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "RustDesk"
+    },
+    {
+      "name": "READ_PASTEBOARD_reason",
+      "value": "Allow RustDesk to synchronize clipboard text with authorized remote desktop sessions."
+    },
+    {
+      "name": "CUSTOM_SCREEN_RECORDING_reason",
+      "value": "Allow RustDesk to start controlled-side screen sharing without repeated privacy alerts."
+    },
+    {
+      "name": "CONTROL_DEVICE_reason",
+      "value": "Allow authorized remote controllers to inject mouse, touch, and keyboard input on this device."
+    }
+  ]
+}

@@ -500,8 +500,14 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
 
   triggerAutoHide() => _debouncerHide.value = _debouncerHide.value + 1;
 
-  void _minimize() async =>
-      await WindowController.fromWindowId(windowId).minimize();
+  void _minimize() async {
+    if (isOhos) {
+      // The window_manager plugin is not registered on HarmonyOS.
+      await platformFFI.minimizeWindow();
+      return;
+    }
+    await WindowController.fromWindowId(windowId).minimize();
+  }
 
   Future<void> _syncDockingOptions({required bool force}) async {
     final syncSerial = ++_dockingOptionSyncSerial;
@@ -1378,6 +1384,9 @@ class ScreenAdjustor {
   int get windowId => stateGlobal.windowId;
 
   Future<bool?> isWindowMaximized() async {
+    if (isOhos) {
+      return platformFFI.isWindowMaximized();
+    }
     try {
       return await WindowController.fromWindowId(windowId).isMaximized();
     } catch (_) {
@@ -2932,7 +2941,7 @@ class _VoiceCallMenu extends StatelessWidget {
         audioInput,
         Divider(),
         MenuButton(
-          child: Text(translate('End call')),
+          child: Text(translate('Stop voice call')),
           onPressed: () => bind.sessionCloseVoiceCall(sessionId: ffi.sessionId),
           ffi: ffi,
         ),

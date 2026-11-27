@@ -1248,9 +1248,40 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             }).marginOnly(left: _kContentHMargin),
         Column(
           children: [
-            _OptionCheckBox(
-                context, 'Enable keyboard/mouse', kOptionEnableKeyboard,
-                enabled: enabled, fakeValue: fakeValue),
+            if (isOhos)
+              ChangeNotifierProvider.value(
+                value: gFFI.serverModel,
+                child: Consumer<ServerModel>(
+                  builder: (context, serverModel, _) => _OptionCheckBox(
+                    context,
+                    'Enable keyboard/mouse',
+                    kOptionEnableKeyboard,
+                    enabled: enabled,
+                    fakeValue:
+                        fakeValue == true && !serverModel.inputControlSupported
+                            ? false
+                            : fakeValue,
+                    optGetter: () =>
+                        serverModel.inputControlSupported &&
+                        mainGetBoolOptionSync(kOptionEnableKeyboard),
+                    optSetter: (k, v) async {
+                      if (v && !serverModel.inputControlSupported) {
+                        await platformFFI.syncOhosHostPermissions();
+                        if (!serverModel.inputControlSupported) {
+                          gFFI.serverModel.showOhosHostPermissionDialog(
+                              requireControlDeviceOnly: true);
+                          return;
+                        }
+                      }
+                      await mainSetBoolOption(k, v);
+                    },
+                  ),
+                ),
+              )
+            else
+              _OptionCheckBox(
+                  context, 'Enable keyboard/mouse', kOptionEnableKeyboard,
+                  enabled: enabled, fakeValue: fakeValue),
             if (isWindows)
               _OptionCheckBox(
                   context, 'Enable remote printer', kOptionEnableRemotePrinter,
@@ -1264,14 +1295,16 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                 enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(context, 'Enable camera', kOptionEnableCamera,
                 enabled: enabled, fakeValue: fakeValue),
-            _OptionCheckBox(context, 'Enable terminal', kOptionEnableTerminal,
-                enabled: enabled, fakeValue: fakeValue),
+            if (!isOhos)
+              _OptionCheckBox(context, 'Enable terminal', kOptionEnableTerminal,
+                  enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(
                 context, 'Enable TCP tunneling', kOptionEnableTunnel,
                 enabled: enabled, fakeValue: fakeValue),
-            _OptionCheckBox(
-                context, 'Enable remote restart', kOptionEnableRemoteRestart,
-                enabled: enabled, fakeValue: fakeValue),
+            if (!isOhos)
+              _OptionCheckBox(
+                  context, 'Enable remote restart', kOptionEnableRemoteRestart,
+                  enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(
                 context, 'Enable recording session', kOptionEnableRecordSession,
                 enabled: enabled, fakeValue: fakeValue),
@@ -2890,6 +2923,19 @@ class _WaylandCardState extends State<WaylandCard> {
                 "true";
 
         final children = [
+          if (isLinux &&
+              bind.mainIsInstalled() &&
+              !bind.isOutgoingOnly() &&
+              !bind.isDisableSettings() &&
+              bind.mainGetCommonSync(key: 'is-drm-capture-supported') ==
+                  'true') ...[
+            _OptionCheckBox(
+                context, 'Use DRM screen capture', kOptionAllowDrmCapture),
+            Align(
+              alignment: Alignment.topLeft,
+              child: Text(translate('drm-capture-tip')),
+            ).marginOnly(left: _kCardLeftMargin),
+          ],
           if (restoreToken.isNotEmpty)
             _buildClearScreenSelection(context, restoreToken),
           if (hasShortcutsPermission)

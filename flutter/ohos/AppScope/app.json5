@@ -1,0 +1,10 @@
+{
+  "app": {
+    "bundleName": "com.carriez.flutter_hbb",
+    "vendor": "rustdesk",
+    "versionCode": 71,
+    "versionName": "1.5.3",
+    "icon": "$media:app_icon",
+    "label": "$string:app_name"
+  }
+}

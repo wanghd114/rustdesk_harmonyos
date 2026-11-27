@@ -51,13 +51,17 @@ class _DesktopServerPageState extends State<DesktopServerPage>
 
   @override
   void initState() {
-    windowManager.addListener(this);
+    if (!isOhos) {
+      windowManager.addListener(this);
+    }
     super.initState();
   }
 
   @override
   void dispose() {
-    windowManager.removeListener(this);
+    if (!isOhos) {
+      windowManager.removeListener(this);
+    }
     super.dispose();
   }
 
@@ -69,6 +73,8 @@ class _DesktopServerPageState extends State<DesktopServerPage>
     Future.wait([gFFI.serverModel.closeAll(byOperator: byOperator), gFFI.close()]).then((_) {
       if (isMacOS) {
         RdPlatformChannel.instance.terminate();
+      } else if (isOhos) {
+        platformFFI.closeWindow();
       } else {
         windowManager.setPreventClose(false);
         windowManager.close();
@@ -79,7 +85,11 @@ class _DesktopServerPageState extends State<DesktopServerPage>
 
   void onRemoveId(String id) {
     if (tabController.state.value.tabs.isEmpty) {
-      windowManager.close();
+      if (isOhos) {
+        platformFFI.closeWindow();
+      } else {
+        windowManager.close();
+      }
     }
   }
 
@@ -140,7 +150,9 @@ class ConnectionManagerState extends State<ConnectionManager>
               gFFI.chatModel.showChatPage(MessageKey(client.peerId, client.id));
             });
           }
-          windowManager.setTitle(getWindowNameWithId(client.peerId));
+          if (!isOhos) {
+            windowManager.setTitle(getWindowNameWithId(client.peerId));
+          }
           gFFI.cmFileModel.updateCurrentClientId(client.id);
         }
       }
@@ -224,9 +236,13 @@ class ConnectionManagerState extends State<ConnectionManager>
               },
               pageViewBuilder: (pageView) => LayoutBuilder(
                 builder: (context, constrains) {
+                  final showSidePage = isOhos
+                      ? constrains.maxWidth >=
+                          kConnectionManagerWindowSizeClosedChat.width + 200
+                      : constrains.maxWidth >
+                          kConnectionManagerWindowSizeClosedChat.width;
                   var borderWidth = 0.0;
-                  if (constrains.maxWidth >
-                      kConnectionManagerWindowSizeClosedChat.width) {
+                  if (showSidePage) {
                     borderWidth = kConnectionManagerWindowSizeOpenChat.width -
                         constrains.maxWidth;
                   } else {
@@ -236,14 +252,21 @@ class ConnectionManagerState extends State<ConnectionManager>
                   if (borderWidth < 0 || borderWidth > 50) {
                     borderWidth = 0;
                   }
-                  final realClosedWidth =
-                      kConnectionManagerWindowSizeClosedChat.width -
+                  final realClosedWidth = isOhos
+                      ? 320.0
+                      : kConnectionManagerWindowSizeClosedChat.width -
                           borderWidth;
                   final realChatPageWidth =
                       constrains.maxWidth - realClosedWidth;
+                  final mainPage = allowRemoteCMModification()
+                      ? pageView
+                      : buildRemoteBlock(
+                          child: _buildKeyEventBlock(pageView),
+                          block: _controlPageBlock,
+                          mask: false,
+                        );
                   final row = Row(children: [
-                    if (constrains.maxWidth >
-                        kConnectionManagerWindowSizeClosedChat.width)
+                    if (showSidePage)
                       Consumer<ChatModel>(
                           builder: (_, model, child) => SizedBox(
                                 width: realChatPageWidth,
@@ -254,17 +277,13 @@ class ConnectionManagerState extends State<ConnectionManager>
                                         block: _sidePageBlock,
                                         mask: true),
                               )),
-                    SizedBox(
-                        width: realClosedWidth,
-                        child: SizedBox(
-                            width: realClosedWidth,
-                            child: allowRemoteCMModification()
-                                ? pageView
-                                : buildRemoteBlock(
-                                    child: _buildKeyEventBlock(pageView),
-                                    block: _controlPageBlock,
-                                    mask: false,
-                                  ))),
+                    if (isOhos && !showSidePage)
+                      Expanded(child: mainPage)
+                    else
+                      SizedBox(
+                          width: realClosedWidth,
+                          child: SizedBox(
+                              width: realClosedWidth, child: mainPage)),
                   ]);
                   return Container(
                     color: Theme.of(context).scaffoldBackgroundColor,
@@ -303,7 +322,11 @@ class ConnectionManagerState extends State<ConnectionManager>
           Expanded(
             child: GestureDetector(
               onPanStart: (d) {
-                windowManager.startDragging();
+                if (isOhos) {
+                  platformFFI.startMovingWindow();
+                } else {
+                  windowManager.startDragging();
+                }
               },
               child: Container(
                 color: Theme.of(context).colorScheme.background,
@@ -339,7 +362,11 @@ class ConnectionManagerState extends State<ConnectionManager>
     final connLength = tabController.length;
     if (connLength <= 1) {
       _cmClosedByOperator = true;
-      windowManager.close();
+      if (isOhos) {
+        await platformFFI.closeWindow();
+      } else {
+        windowManager.close();
+      }
       return true;
     } else {
       final bool res;
@@ -353,7 +380,11 @@ class ConnectionManagerState extends State<ConnectionManager>
         // After the dialog, never before it: an external close while it is open must not
         // inherit an intent the user had not expressed yet.
         _cmClosedByOperator = true;
-        windowManager.close();
+        if (isOhos) {
+          await platformFFI.closeWindow();
+        } else {
+          windowManager.close();
+        }
       }
       return res;
     }
@@ -404,7 +435,11 @@ class _CloseButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return IconButton(
       onPressed: () {
-        windowManager.close();
+        if (isOhos) {
+          platformFFI.closeWindow();
+        } else {
+          windowManager.close();
+        }
       },
       icon: const Icon(
         IconFont.close,
@@ -661,16 +696,22 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
 
   @override
   Widget build(BuildContext context) {
+    final serverModel = Provider.of<ServerModel>(context);
     final crossAxisCount = 4;
     final spacing = 10.0;
     final canModifyPermission =
         bind.mainGetBuildinOption(key: kOptionEnablePermChangeInAcceptWindow) !=
             'N';
+    final isKeyboardPermitted = !isOhos ||
+        (serverModel.inputOk && serverModel.inputControlSupported);
+    final isKeyboardEffective = client.keyboard && isKeyboardPermitted;
     return Container(
       width: double.infinity,
-      height: 160.0,
+      height: isOhos ? null : 160.0,
       margin: EdgeInsets.all(5.0),
-      padding: EdgeInsets.all(5.0),
+      padding: isOhos
+          ? const EdgeInsets.fromLTRB(5.0, 5.0, 5.0, 10.0)
+          : const EdgeInsets.all(5.0),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(10.0),
         color: Theme.of(context).colorScheme.background,
@@ -684,6 +725,7 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
         ],
       ),
       child: Column(
+        mainAxisSize: isOhos ? MainAxisSize.min : MainAxisSize.max,
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
           Text(
@@ -691,8 +733,11 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             textAlign: TextAlign.center,
           ).marginOnly(left: 4.0, bottom: 8.0),
-          Expanded(
+          Flexible(
+            fit: isOhos ? FlexFit.loose : FlexFit.tight,
             child: GridView.count(
+              shrinkWrap: isOhos,
+              physics: isOhos ? const NeverScrollableScrollPhysics() : null,
               crossAxisCount: crossAxisCount,
               padding: EdgeInsets.symmetric(horizontal: spacing),
               mainAxisSpacing: spacing,
@@ -744,7 +789,8 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                           });
                         },
                         translate('Enable keyboard/mouse'),
-                        canModify: canModifyPermission,
+                        canModify:
+                            canModifyPermission && serverModel.inputControlSupported,
                       ),
                       buildPermissionIcon(
                         client.clipboard,
@@ -791,21 +837,22 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                         translate('Enable file copy and paste'),
                         canModify: canModifyPermission,
                       ),
-                      buildPermissionIcon(
-                        client.restart,
-                        Icons.restart_alt_rounded,
-                        (enabled) {
-                          bind.cmSwitchPermission(
-                              connId: client.id,
-                              name: "restart",
-                              enabled: enabled);
-                          setState(() {
-                            client.restart = enabled;
-                          });
-                        },
-                        translate('Enable remote restart'),
-                        canModify: canModifyPermission,
-                      ),
+                      if (!isOhos)
+                        buildPermissionIcon(
+                          client.restart,
+                          Icons.restart_alt_rounded,
+                          (enabled) {
+                            bind.cmSwitchPermission(
+                                connId: client.id,
+                                name: "restart",
+                                enabled: enabled);
+                            setState(() {
+                              client.restart = enabled;
+                            });
+                          },
+                          translate('Enable remote restart'),
+                          canModify: canModifyPermission,
+                        ),
                       buildPermissionIcon(
                         client.recording,
                         Icons.videocam_rounded,
@@ -1023,7 +1070,11 @@ class _CmControlPanel extends StatelessWidget {
             color: MyTheme.accent,
             onClick: () {
               handleElevate(context);
-              windowManager.minimize();
+              if (isOhos) {
+                platformFFI.minimizeWindow();
+              } else {
+                windowManager.minimize();
+              }
             },
             icon: Icon(
               Icons.security_rounded,
@@ -1039,7 +1090,7 @@ class _CmControlPanel extends StatelessWidget {
             Expanded(
               child: buildButton(context,
                   color: Colors.redAccent,
-                  onClick: handleDisconnect,
+                  onClick: () => handleDisconnect(context),
                   text: 'Disconnect',
                   icon: Icon(
                     Icons.link_off_rounded,
@@ -1086,7 +1137,11 @@ class _CmControlPanel extends StatelessWidget {
           child: buildButton(context, color: Colors.green[700], onClick: () {
             handleAccept(context);
             handleElevate(context);
-            windowManager.minimize();
+            if (isOhos) {
+              platformFFI.minimizeWindow();
+            } else {
+              windowManager.minimize();
+            }
           },
               text: 'Accept and Elevate',
               icon: Icon(
@@ -1109,7 +1164,9 @@ class _CmControlPanel extends StatelessWidget {
                       color: MyTheme.accent,
                       onClick: () {
                         handleAccept(context);
-                        windowManager.minimize();
+                        if (!isOhos) {
+                          windowManager.minimize();
+                        }
                       },
                       text: 'Accept',
                       textColor: Colors.white,
@@ -1122,7 +1179,7 @@ class _CmControlPanel extends StatelessWidget {
                 context,
                 color: Colors.transparent,
                 border: Border.all(color: Colors.grey),
-                onClick: handleDisconnect,
+                onClick: () => handleDisconnect(context),
                 text: 'Cancel',
                 textColor: null,
               ),
@@ -1194,8 +1251,15 @@ class _CmControlPanel extends StatelessWidget {
         .marginAll(4);
   }
 
-  void handleDisconnect() {
-    bind.cmCloseConnection(connId: client.id);
+  void handleDisconnect(BuildContext context) {
+    if (isOhos && !client.authorized) {
+      final model = context.mounted
+          ? Provider.of<ServerModel>(context, listen: false)
+          : gFFI.serverModel;
+      model.sendLoginResponse(client, false);
+    } else {
+      bind.cmCloseConnection(connId: client.id);
+    }
   }
 
   void handleAccept(BuildContext context) {
@@ -1212,7 +1276,11 @@ class _CmControlPanel extends StatelessWidget {
   void handleClose() async {
     await bind.cmRemoveDisconnectedConnection(connId: client.id);
     if (await bind.cmGetClientsLength() == 0) {
-      windowManager.close();
+      if (isOhos) {
+        await platformFFI.closeWindow();
+      } else {
+        windowManager.close();
+      }
     }
   }
 

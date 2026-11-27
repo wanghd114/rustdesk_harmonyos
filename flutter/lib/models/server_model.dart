@@ -29,6 +29,11 @@ class ServerModel with ChangeNotifier {
   bool _isStart = false; // Android MainService status
   bool _mediaOk = false;
   bool _inputOk = false;
+
+  /// Whether this device can intercept input at all. Non-OHOS platforms keep
+  /// upstream behavior; on OHOS only an OS injection authorization counts.
+  bool get inputControlSupported =>
+      !isOhos || platformFFI.isOhosHostInputAuthorized;
   bool _audioOk = false;
   bool _fileOk = false;
   bool _clipboardOk = false;
@@ -40,6 +45,10 @@ class ServerModel with ChangeNotifier {
   bool _allowNumericOneTimePassword = false;
   String _approveMode = "";
   int _zeroClientLengthCounter = 0;
+  bool _ohosCmWindowOpen = false;
+  bool _ohosCmWindowOpening = false;
+  int _ohosPermPollTick = 0;
+  bool _ohosHostPermReminded = false;
 
   late String _emptyIdShow;
   late final IDTextEditingController _serverId;
@@ -165,15 +174,58 @@ class ServerModel with ChangeNotifier {
           updateClientState(res);
         } else {
           if (_clients.isEmpty) {
-            hideCmWindow();
-            if (_zeroClientLengthCounter++ == 12) {
-              // 6 second
-              windowManager.close();
+            if (isOhos) {
+              if (_zeroClientLengthCounter++ >= 2) {
+                platformFFI.closeWindow();
+              }
+            } else {
+              hideCmWindow();
+              if (_zeroClientLengthCounter++ == 12) {
+                // 6 second
+                windowManager.close();
+              }
             }
           } else {
             _zeroClientLengthCounter = 0;
-            if (!hideCm) showCmWindow();
+            if (!isOhos && !hideCm) showCmWindow();
           }
+        }
+      }
+
+      if (isOhos) {
+        final captureRunning = platformFFI.isOhosHostCaptureRunning;
+        if (_isStart && !captureRunning) {
+          // Capture ended outside the app (system stop button, consent cancel,
+          // or interruption): tear down the host service, continuous task and
+          // UI state to match.
+          await stopService();
+        } else if (_mediaOk != captureRunning) {
+          _mediaOk = captureRunning;
+          notifyListeners();
+        }
+        if (desktopType != DesktopType.cm && _clients.isEmpty) {
+          _ohosCmWindowOpen = false;
+        }
+        if (!inputControlSupported && (++_ohosPermPollTick % 4 == 0)) {
+          await platformFFI.syncOhosHostPermissions();
+          if (inputControlSupported) {
+            notifyListeners();
+          }
+        }
+        if (inputControlSupported &&
+            bind.mainGetLocalOption(key: 'ohos-keyboard-perm-migrated') != 'Y') {
+          bind.mainSetOption(key: kOptionEnableKeyboard, value: defaultOptionYes);
+          bind.mainSetLocalOption(key: 'ohos-keyboard-perm-migrated', value: 'Y');
+        }
+        // The HarmonyOS controlled side has no platform service that echoes the
+        // keyboard permission back, so the option is the state the UI shows. It
+        // only counts while the core holds an injection authorization; a device
+        // that cannot intercept input never gets one, so the switch stays off.
+        final inputOk = inputControlSupported &&
+            bind.mainGetOptionSync(key: kOptionEnableKeyboard) != 'N';
+        if (_inputOk != inputOk) {
+          _inputOk = inputOk;
+          notifyListeners();
         }
       }
 
@@ -191,9 +243,22 @@ class ServerModel with ChangeNotifier {
       });
     }
 
-    // Initial keyboard status is off on mobile
-    if (isMobile) {
+    // Initial keyboard status is off on iOS; Android syncs it from InputService natively.
+    if (isIOS) {
       bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
+    } else if (isOhos) {
+      if (!inputControlSupported) {
+        // Keep in-memory state off without overwriting persisted config; once
+        // CONTROL_DEVICE is granted the host becomes controllable immediately.
+        _inputOk = false;
+      }
+      // HarmonyOS normal_hap cannot host a system terminal, virtual remote
+      // printer, OS reboot, or input-blocking driver; keep these off so peers
+      // are not offered unsupported controls.
+      bind.mainSetOption(key: kOptionEnableTerminal, value: 'N');
+      bind.mainSetOption(key: kOptionEnableRemotePrinter, value: 'N');
+      bind.mainSetOption(key: kOptionEnableRemoteRestart, value: 'N');
+      bind.mainSetOption(key: kOptionEnableBlockInput, value: 'N');
     }
   }
 
@@ -221,6 +286,19 @@ class ServerModel with ChangeNotifier {
     final clipOption = await bind.mainGetOption(key: kOptionEnableClipboard);
     _clipboardOk = clipOption != 'N';
 
+    notifyListeners();
+  }
+
+  checkOhosPermission() async {
+    final audioOption = await bind.mainGetOption(key: kOptionEnableAudio);
+    final fileOption = await bind.mainGetOption(key: kOptionEnableFileTransfer);
+    final clipOption = await bind.mainGetOption(key: kOptionEnableClipboard);
+    final keyboardOption =
+        await bind.mainGetOption(key: kOptionEnableKeyboard);
+    _audioOk = audioOption != 'N';
+    _fileOk = fileOption != 'N';
+    _clipboardOk = clipOption != 'N';
+    _inputOk = keyboardOption != 'N';
     notifyListeners();
   }
 
@@ -332,8 +410,22 @@ class ServerModel with ChangeNotifier {
   }
 
   toggleInput() async {
+    if (isOhos && !inputControlSupported) {
+      // The device cannot intercept input, so there is nothing to toggle.
+      return;
+    }
     if (clients.any((c) => !c.disconnected)) {
       await showClientsMayNotBeChangedAlert(parent.target);
+    }
+    if (isOhos) {
+      // No platform service echoes the input permission back on HarmonyOS, so
+      // the keyboard option is the state this switch shows.
+      _inputOk = !_inputOk;
+      bind.mainSetOption(
+          key: kOptionEnableKeyboard,
+          value: _inputOk ? defaultOptionYes : 'N');
+      notifyListeners();
+      return;
     }
     if (_inputOk) {
       parent.target?.invokeMethod("stop_input");
@@ -377,6 +469,14 @@ class ServerModel with ChangeNotifier {
 
   /// Toggle the screen sharing service.
   toggleService() async {
+    if (isOhos) {
+      if (_isStart) {
+        await stopService();
+      } else {
+        await startService();
+      }
+      return;
+    }
     if (_isStart) {
       final res = await parent.target?.dialogManager
           .show<bool>((setState, close, context) {
@@ -440,6 +540,34 @@ class ServerModel with ChangeNotifier {
 
   /// Start the screen sharing service.
   Future<void> startService() async {
+    if (isOhos) {
+      try {
+        final error = await platformFFI.startOhosHost();
+        if (error.isNotEmpty) {
+          throw Exception(error);
+        }
+        _isStart = true;
+        _mediaOk = platformFFI.isOhosHostCaptureRunning;
+        WakelockManager.enable(_wakelockKey, isServer: true);
+        parent.target?.ffiModel
+            .updateEventListener(parent.target!.sessionId, "");
+        if (inputControlSupported &&
+            bind.mainGetLocalOption(key: 'ohos-keyboard-perm-migrated') != 'Y') {
+          bind.mainSetOption(key: kOptionEnableKeyboard, value: defaultOptionYes);
+          bind.mainSetLocalOption(key: 'ohos-keyboard-perm-migrated', value: 'Y');
+        }
+        updateClientState();
+        _maybeRemindOhosHostPermissions();
+      } catch (error) {
+        _isStart = false;
+        _mediaOk = false;
+        debugPrint('Failed to start OHOS host: $error');
+        showToast(error.toString());
+      } finally {
+        notifyListeners();
+      }
+      return;
+    }
     _isStart = true;
     notifyListeners();
     parent.target?.ffiModel.updateEventListener(parent.target!.sessionId, "");
@@ -454,6 +582,19 @@ class ServerModel with ChangeNotifier {
 
   /// Stop the screen sharing service.
   Future<void> stopService() async {
+    if (isOhos) {
+      _isStart = false;
+      _mediaOk = false;
+      _inputOk = false;
+      closeAll();
+      WakelockManager.disable(_wakelockKey);
+      notifyListeners();
+      final error = await platformFFI.stopOhosHost();
+      if (error.isNotEmpty) {
+        showToast(error);
+      }
+      return;
+    }
     _isStart = false;
     closeAll();
     await parent.target?.invokeMethod("stop_service");
@@ -519,7 +660,7 @@ class ServerModel with ChangeNotifier {
         debugPrint("Failed to decode clientJson '$clientJson', error $e");
       }
     }
-    if (desktopType == DesktopType.cm) {
+    if (desktopType == DesktopType.cm && !isOhos) {
       if (_clients.isEmpty) {
         hideCmWindow();
       } else if (!hideCm) {
@@ -535,11 +676,13 @@ class ServerModel with ChangeNotifier {
   void addConnection(Map<String, dynamic> evt) {
     try {
       final client = Client.fromJson(jsonDecode(evt["client"]));
+      bool isNewClient = false;
       if (client.authorized) {
         parent.target?.dialogManager.dismissByTag(getLoginDialogTag(client.id));
         final index = _clients.indexWhere((c) => c.id == client.id);
         if (index < 0) {
           _clients.add(client);
+          isNewClient = true;
         } else {
           if (_clients[index].authorized) {
             _clients[index].privacyMode = client.privacyMode;
@@ -548,6 +691,7 @@ class ServerModel with ChangeNotifier {
           }
           _clients[index].authorized = true;
           _clients[index].privacyMode = client.privacyMode;
+          notifyListeners();
         }
       } else {
         final index = _clients.indexWhere((c) => c.id == client.id);
@@ -557,8 +701,11 @@ class ServerModel with ChangeNotifier {
           return;
         }
         _clients.add(client);
+        isNewClient = true;
       }
-      _addTab(client);
+      if (isNewClient) {
+        _addTab(client);
+      }
       // remove disconnected
       final index_disconnected = _clients
           .indexWhere((c) => c.disconnected && c.peerId == client.peerId);
@@ -566,16 +713,99 @@ class ServerModel with ChangeNotifier {
         _clients.removeAt(index_disconnected);
         tabController.remove(index_disconnected);
       }
-      if (desktopType == DesktopType.cm && !hideCm) {
+      if (desktopType == DesktopType.cm && !isOhos && !hideCm) {
         showCmWindow();
       }
       scrollToBottom();
       notifyListeners();
-      if (isAndroid && !client.authorized) showLoginDialog(client);
+      if (isOhos && isOhosDesktop && desktopType != DesktopType.cm) {
+        _openOhosCmWindow();
+      } else if ((isAndroid || isOhos) && !client.authorized) {
+        showLoginDialog(client);
+      }
       if (isAndroid) androidUpdatekeepScreenOn();
     } catch (e) {
       debugPrint("Failed to call loginRequest,error:$e");
     }
+  }
+
+  void _openOhosCmWindow() {
+    if (_ohosCmWindowOpening || _ohosCmWindowOpen) return;
+    _ohosCmWindowOpening = true;
+    platformFFI
+        .openSessionWindow(
+          {'kind': 'cm'},
+          translate('RustDesk'),
+          width: 320,
+          height: 490,
+          align: 'topRight',
+        )
+        .then((_) {
+          _ohosCmWindowOpen = true;
+        })
+        .catchError((error) {
+          debugPrint('Failed to open OHOS CM window: $error');
+        })
+        .whenComplete(() => _ohosCmWindowOpening = false);
+  }
+
+  void _maybeRemindOhosHostPermissions() {
+    if (!isOhos || _ohosHostPermReminded) return;
+    if (!(ohosDeviceType == '2in1' || isOhosDesktop)) return;
+    final missingScreenRecording =
+        !platformFFI.isOhosCustomScreenRecordingGranted;
+    final missingControlDevice = !platformFFI.isOhosHostInputAuthorized;
+    if (!missingScreenRecording && !missingControlDevice) return;
+    _ohosHostPermReminded = true;
+    showOhosHostPermissionDialog();
+  }
+
+  void showOhosHostPermissionDialog({bool requireControlDeviceOnly = false}) {
+    if (!isOhos) return;
+    final missingScreenRecording = !requireControlDeviceOnly &&
+        !platformFFI.isOhosCustomScreenRecordingGranted;
+    final missingControlDevice =
+        requireControlDeviceOnly || !platformFFI.isOhosHostInputAuthorized;
+    if (!missingScreenRecording && !missingControlDevice) return;
+    final missingItems = <String>[
+      if (missingScreenRecording) '• CUSTOM_SCREEN_RECORDING（无弹窗录屏）',
+      if (missingControlDevice) '• CONTROL_DEVICE（远程键鼠控制）',
+    ];
+    final dialogManager = parent.target?.dialogManager ?? gFFI.dialogManager;
+    const dialogTag = 'ohos-host-acl-permission';
+    dialogManager.dismissByTag(dialogTag);
+    dialogManager.show((setState, close, context) {
+      openSettings() {
+        platformFFI.openSystemSettings();
+        close();
+      }
+
+      return CustomAlertDialog(
+        title: Row(children: [
+          const Icon(Icons.admin_panel_settings_outlined,
+              color: Colors.orangeAccent, size: 24),
+          const SizedBox(width: 8),
+          Text(translate('Permissions')),
+        ]),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('当前设备缺少以下受限系统权限，部分被控功能可能受限：'),
+            const SizedBox(height: 8),
+            ...missingItems.map((item) => Text(item)),
+            const SizedBox(height: 10),
+            const Text('请前往 系统设置 → 隐私和安全 中为本应用开启对应权限。'),
+          ],
+        ),
+        actions: [
+          dialogButton('知道了', onPressed: close, isOutline: true),
+          dialogButton('前往设置', onPressed: openSettings),
+        ],
+        onSubmit: openSettings,
+        onCancel: close,
+      );
+    }, tag: dialogTag);
   }
 
   void _addTab(Client client) {
@@ -585,9 +815,11 @@ class ServerModel with ChangeNotifier {
         closable: false,
         onTap: () {},
         page: desktop.buildConnectionCard(client)));
-    Future.delayed(Duration.zero, () async {
-      if (!hideCm) windowOnTop(null);
-    });
+    if (!isOhos) {
+      Future.delayed(Duration.zero, () async {
+        if (!hideCm) windowOnTop(null);
+      });
+    }
     // Only do the hidden task when on Desktop.
     if (client.authorized && isDesktop) {
       cmHiddenTimer = Timer(const Duration(seconds: 3), () {
@@ -700,6 +932,7 @@ class ServerModel with ChangeNotifier {
       tabController.remove(index);
       _clients.remove(client);
       if (isAndroid) androidUpdatekeepScreenOn();
+      notifyListeners();
     }
   }
 
@@ -720,8 +953,11 @@ class ServerModel with ChangeNotifier {
         parent.target?.dialogManager.dismissByTag(getLoginDialogTag(id));
         parent.target?.invokeMethod("cancel_notification", id);
       }
-      if (desktopType == DesktopType.cm && _clients.isEmpty) {
+      if (desktopType == DesktopType.cm && !isOhos && _clients.isEmpty) {
         hideCmWindow();
+      }
+      if (isOhos && _clients.isEmpty) {
+        _ohosCmWindowOpen = false;
       }
       if (isAndroid) androidUpdatekeepScreenOn();
       notifyListeners();
@@ -764,7 +1000,7 @@ class ServerModel with ChangeNotifier {
         if (client.incomingVoiceCall) {
           if (isAndroid) {
             showVoiceCallDialog(client);
-          } else {
+          } else if (!isOhos) {
             // Has incoming phone call, let's set the window on top.
             Future.delayed(Duration.zero, () {
               windowOnTop(null);

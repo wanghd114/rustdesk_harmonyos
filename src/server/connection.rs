@@ -392,6 +392,12 @@ pub struct Connection {
     recording: bool,
     block_input: bool,
     privacy_mode: bool,
+    // Dropping the receiver cancels the pending activation.
+    #[cfg(windows)]
+    privacy_preparation: Option<(
+        String,
+        hbb_common::tokio::sync::oneshot::Receiver<ResultType<Option<u32>>>,
+    )>,
     control_permissions: Option<ControlPermissions>,
     last_test_delay: Option<Instant>,
     network_delay: u32,
@@ -611,6 +617,8 @@ impl Connection {
             recording: Self::permission(keys::OPTION_ENABLE_RECORD_SESSION, &control_permissions),
             block_input: Self::permission(keys::OPTION_ENABLE_BLOCK_INPUT, &control_permissions),
             privacy_mode: Self::permission(keys::OPTION_ENABLE_PRIVACY_MODE, &control_permissions),
+            #[cfg(windows)]
+            privacy_preparation: None,
             control_permissions,
             last_test_delay: None,
             network_delay: 0,
@@ -677,10 +685,9 @@ impl Connection {
         };
         #[cfg(target_env = "ohos")]
         {
-            // Input injection needs the system-restricted INJECT_EVENT permission
-            // a third-party HarmonyOS app cannot get, so a controlled OHOS peer is
-            // view-only for now (file transfer / clipboard / audio stay available).
-            conn.keyboard = false;
+            if !crate::server::input_service::is_ohos_input_authorized() {
+                conn.keyboard = false;
+            }
         }
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -821,10 +828,15 @@ impl Connection {
                         }
                         ipc::Data::SwitchPermission{name, enabled} => {
                             log::info!("Change permission {} -> {}", name, enabled);
+                            // Android broadcasts these to every connection; only remote sessions use them.
+                            if (&name == "keyboard" || &name == "clipboard") && !conn.is_remote() {
+                                continue;
+                            }
                             if &name == "keyboard" {
                                 conn.keyboard = enabled;
                                 conn.send_permission(Permission::Keyboard, enabled).await;
-                                if let Some(s) = conn.server.upgrade() {
+                                // Until authorized, only record the value; try_sub_monitor_services subscribes from it.
+                                if let Some(s) = conn.server.upgrade().filter(|_| conn.authorized) {
                                     s.write().unwrap().subscribe(
                                         super::clipboard_service::NAME,
                                         conn.inner.clone(), conn.can_sub_clipboard_service());
@@ -841,7 +853,7 @@ impl Connection {
                             } else if &name == "clipboard" {
                                 conn.clipboard = enabled;
                                 conn.send_permission(Permission::Clipboard, enabled).await;
-                                if let Some(s) = conn.server.upgrade() {
+                                if let Some(s) = conn.server.upgrade().filter(|_| conn.authorized) {
                                     s.write().unwrap().subscribe(
                                         super::clipboard_service::NAME,
                                         conn.inner.clone(), conn.can_sub_clipboard_service());
@@ -872,7 +884,7 @@ impl Connection {
                                     conn.try_empty_file_clipboard();
                                 }
                                 #[cfg(feature = "unix-file-copy-paste")]
-                                if let Some(s) = conn.server.upgrade() {
+                                if let Some(s) = conn.server.upgrade().filter(|_| conn.authorized) {
                                     s.write().unwrap().subscribe(
                                         super::clipboard_service::FILE_NAME,
                                         conn.inner.clone(),
@@ -889,6 +901,10 @@ impl Connection {
                                 conn.block_input = enabled;
                                 conn.send_permission(Permission::BlockInput, enabled).await;
                             } else if &name == "privacy_mode" {
+                                #[cfg(windows)]
+                                if !enabled {
+                                    conn.privacy_preparation = None;
+                                }
                                 // Keep permission state and runtime state consistent:
                                 // when revoking the permission, try to leave privacy mode first.
                                 // Otherwise we could end up in an inconsistent state where
@@ -961,6 +977,8 @@ impl Connection {
                             }
                         }
                         ipc::Data::PrivacyModeState((_, state, impl_key)) => {
+                            #[cfg(windows)]
+                            conn.privacy_preparation.take();
                             let msg_out = match state {
                                 privacy_mode::PrivacyModeState::OffSucceeded => {
                                     crate::common::make_privacy_mode_msg(
@@ -1180,6 +1198,16 @@ impl Connection {
                             conn.on_close("privacy mode", false).await;
                             break;
                         }
+                        #[cfg(windows)]
+                        ipc::Data::PrivacyModeState((_, privacy_mode::PrivacyModeState::OffUnknown, impl_key)) => {
+                            if privacy_mode::get_cur_impl_key().as_deref() == Some(impl_key.as_str()) {
+                                conn.privacy_preparation = None;
+                                conn.send(crate::common::make_privacy_mode_msg(
+                                    back_notification::PrivacyModeState::PrvOffUnknown,
+                                    impl_key,
+                                )).await;
+                            }
+                        }
                         #[cfg(all(target_os = "windows", feature = "flutter"))]
                         ipc::Data::PrinterData(data) => {
                             if Self::permission(keys::OPTION_ENABLE_REMOTE_PRINTER, &conn.control_permissions) {
@@ -1194,6 +1222,11 @@ impl Connection {
                 _ = second_timer.tick() => {
                     #[cfg(windows)]
                     conn.portable_check();
+                    #[cfg(windows)]
+                    if let Some((impl_key, _)) = conn.privacy_preparation.as_ref() {
+                        let impl_key = impl_key.clone();
+                        conn.turn_on_privacy(impl_key).await;
+                    }
                     raii::AuthedConnID::check_wake_lock_on_setting_changed();
                     if let Some((instant, minute)) = conn.auto_disconnect_timer.as_ref() {
                         if instant.elapsed().as_secs() > minute * 60 {
@@ -1301,6 +1334,7 @@ impl Connection {
                         if press {
                             msg.down = true;
                         }
+                        CLICK_TIME.store(get_time(), Ordering::SeqCst);
                         handle_key(&msg);
                         if press {
                             msg.down = false;
@@ -2049,6 +2083,10 @@ impl Connection {
         {
             platform_additions.insert("support_view_camera".into(), json!(true));
         }
+        #[cfg(target_os = "macos")]
+        if camera::is_camera_supported() {
+            platform_additions.insert("support_view_camera".into(), json!(true));
+        }
 
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         if !platform_additions.is_empty() {
@@ -2074,7 +2112,9 @@ impl Connection {
         if self.is_remote() {
             let mut msg = "".to_string();
             #[cfg(feature = "drm")]
-            if !crate::platform::linux::is_x11_for_drm() {
+            if crate::platform::linux::drm_capture_enabled()
+                && !crate::platform::linux::is_x11_for_drm()
+            {
                 super::drm_capturer::settle_unknown_availability().await;
             }
             // Refuse only while nothing can capture a Wayland greeter: the DRM path can.
@@ -2148,9 +2188,27 @@ impl Connection {
             {
                 res.set_error("Viewing this peer's camera is not supported yet".to_string());
             }
-            #[cfg(not(target_env = "ohos"))]
+            // On macOS this can block for up to 30s waiting on the camera permission prompt, so
+            // keep it off the Tokio worker.
+            #[cfg(target_os = "macos")]
+            {
+                pi.displays = tokio::task::spawn_blocking(camera::Cameras::all_info)
+                    .await
+                    .unwrap_or_else(|e| {
+                        log::error!("camera all_info task panicked: {}", e);
+                        Ok(Vec::new())
+                    })
+                    .unwrap_or_else(|e| {
+                        log::error!("camera all_info error: {}", e);
+                        Vec::new()
+                    });
+            }
+            #[cfg(not(any(target_os = "macos", target_env = "ohos")))]
             {
                 pi.displays = camera::Cameras::all_info().unwrap_or(Vec::new());
+            }
+            #[cfg(not(target_env = "ohos"))]
+            {
                 pi.current_display = camera::PRIMARY_CAMERA_IDX as _;
             }
             #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
@@ -3240,9 +3298,18 @@ impl Connection {
                     if self.is_authed_view_camera_conn() {
                         return true;
                     }
+                    #[cfg(target_os = "android")]
+                    if !self.peer_keyboard_enabled() {
+                        self.update_auto_disconnect_timer();
+                        return true;
+                    }
                     #[cfg(any(target_os = "android", target_os = "ios"))]
                     if let Err(e) = call_main_service_pointer_input("mouse", me.mask, me.x, me.y) {
                         log::debug!("call_main_service_pointer_input fail:{}", e);
+                    }
+                    #[cfg(target_env = "ohos")]
+                    if self.peer_keyboard_enabled() {
+                        crate::server::input_service::handle_mouse(&me, self.inner.id());
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
                     if self.peer_keyboard_enabled() {
@@ -3279,6 +3346,11 @@ impl Connection {
                     if self.is_authed_view_camera_conn() {
                         return true;
                     }
+                    #[cfg(target_os = "android")]
+                    if !self.peer_keyboard_enabled() {
+                        self.update_auto_disconnect_timer();
+                        return true;
+                    }
                     #[cfg(any(target_os = "android", target_os = "ios"))]
                     if let Err(e) = match pde.union {
                         Some(pointer_device_event::Union::TouchEvent(touch)) => match touch.union {
@@ -3307,6 +3379,10 @@ impl Connection {
                     } {
                         log::debug!("call_main_service_pointer_input fail:{}", e);
                     }
+                    #[cfg(target_env = "ohos")]
+                    if self.peer_keyboard_enabled() {
+                        crate::server::input_service::handle_pointer(&pde, self.inner.id());
+                    }
                     #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
                     if self.peer_keyboard_enabled() {
                         MOUSE_MOVE_TIME.store(get_time(), Ordering::SeqCst);
@@ -3316,9 +3392,19 @@ impl Connection {
                 }
                 #[cfg(any(target_os = "ios"))]
                 Some(message::Union::KeyEvent(..)) => {}
+                #[cfg(target_env = "ohos")]
+                Some(message::Union::KeyEvent(me)) => {
+                    if !self.is_authed_view_camera_conn() && self.peer_keyboard_enabled() {
+                        crate::server::input_service::handle_key(&me);
+                    }
+                    self.update_auto_disconnect_timer();
+                }
                 #[cfg(any(target_os = "android"))]
                 Some(message::Union::KeyEvent(mut me)) => {
                     if self.is_authed_view_camera_conn() {
+                        return true;
+                    }
+                    if !self.peer_keyboard_enabled() {
                         return true;
                     }
                     let key = match me.mode.enum_value() {
@@ -3377,9 +3463,6 @@ impl Connection {
                         return true;
                     }
                     if self.peer_keyboard_enabled() {
-                        if is_enter(&me) {
-                            CLICK_TIME.store(get_time(), Ordering::SeqCst);
-                        }
                         // https://github.com/rustdesk/rustdesk/issues/8633
                         MOUSE_MOVE_TIME.store(get_time(), Ordering::SeqCst);
 
@@ -5049,6 +5132,19 @@ impl Connection {
                 self.lock_after_session_end = q == BoolOption::Yes;
             }
         }
+        #[cfg(target_env = "ohos")]
+        if let Ok(q) = o.show_remote_cursor.enum_value() {
+            if q != BoolOption::NotSet {
+                self.show_remote_cursor = q == BoolOption::Yes;
+                if let Some(s) = self.server.upgrade() {
+                    s.write().unwrap().subscribe(
+                        NAME_POS,
+                        self.inner.clone(),
+                        self.show_remote_cursor,
+                    );
+                }
+            }
+        }
         #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
         if let Ok(q) = o.show_remote_cursor.enum_value() {
             if q != BoolOption::NotSet {
@@ -5258,8 +5354,40 @@ impl Connection {
         }
     }
 
+    // Return while pending instead of awaiting here: the connection must keep
+    // processing remote input and video while its timer polls for completion.
+    #[cfg(windows)]
+    fn poll_privacy_preparation(
+        &mut self,
+        impl_key: &str,
+    ) -> ResultType<std::task::Poll<Option<u32>>> {
+        use hbb_common::tokio::sync::oneshot::error::TryRecvError;
+        use std::task::Poll;
+        if matches!(&self.privacy_preparation, Some((key, _)) if key != impl_key) {
+            self.privacy_preparation = None;
+        }
+        if let Some((_, receiver)) = self.privacy_preparation.as_mut() {
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return Ok(Poll::Pending),
+                Err(error) => Err(error.into()),
+            };
+            self.privacy_preparation = None;
+            return result.map(Poll::Ready);
+        }
+        self.privacy_preparation = privacy_mode::prepare_virtual_display(impl_key, self.inner.id)?
+            .map(|receiver| (impl_key.to_owned(), receiver));
+        Ok(if self.privacy_preparation.is_some() {
+            Poll::Pending
+        } else {
+            Poll::Ready(None)
+        })
+    }
+
     async fn turn_on_privacy(&mut self, impl_key: String) {
         if !self.is_authed_remote_conn() || !self.privacy_mode {
+            #[cfg(windows)]
+            self.privacy_preparation.take();
             let msg_out = crate::common::make_privacy_mode_msg(
                 back_notification::PrivacyModeState::PrvOnFailedDenied,
                 impl_key,
@@ -5267,6 +5395,28 @@ impl Connection {
             self.send(msg_out).await;
             return;
         }
+
+        #[cfg(windows)]
+        let prepared_display = match self.poll_privacy_preparation(&impl_key) {
+            Ok(std::task::Poll::Pending) => return,
+            Ok(std::task::Poll::Ready(display)) => display,
+            Err(error) => {
+                const LOG_INTERVAL: Duration = Duration::from_secs(1);
+                hbb_common::throttled_log!(
+                    LOG_INTERVAL,
+                    error,
+                    "Failed to prepare privacy mode: {}",
+                    error
+                );
+                self.send(crate::common::make_privacy_mode_msg_with_details(
+                    back_notification::PrivacyModeState::PrvOnFailed,
+                    error.to_string(),
+                    impl_key,
+                ))
+                .await;
+                return;
+            }
+        };
 
         let msg_out = if !privacy_mode::is_privacy_mode_supported() {
             crate::common::make_privacy_mode_msg_with_details(
@@ -5290,7 +5440,13 @@ impl Connection {
                 }
             }
 
-            let turn_on_res = privacy_mode::turn_on_privacy(&impl_key, self.inner.id).await;
+            let turn_on_res = privacy_mode::turn_on_privacy(
+                &impl_key,
+                self.inner.id,
+                #[cfg(windows)]
+                prepared_display,
+            )
+            .await;
             match turn_on_res {
                 Some(Ok(res)) => {
                     if res {
@@ -5349,6 +5505,17 @@ impl Connection {
     }
 
     async fn turn_off_privacy(&mut self, impl_key: String) {
+        #[cfg(windows)]
+        if self.privacy_preparation.take().is_some() && !privacy_mode::is_in_privacy_mode() {
+            // The worker cleans up preparation. Restoring an inactive Mode 2 here
+            // would unplug all virtual displays and race that cleanup.
+            self.send(crate::common::make_privacy_mode_msg(
+                back_notification::PrivacyModeState::PrvOffSucceeded,
+                impl_key,
+            ))
+            .await;
+            return;
+        }
         let msg_out = if !privacy_mode::is_privacy_mode_supported() {
             crate::common::make_privacy_mode_msg_with_details(
                 back_notification::PrivacyModeState::PrvNotSupported,
@@ -5399,6 +5566,8 @@ impl Connection {
             return;
         }
         self.closed = true;
+        #[cfg(windows)]
+        self.privacy_preparation.take();
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //
@@ -5408,6 +5577,8 @@ impl Connection {
         //
         // We can add a (Vec<conn_id>, input device) to avoid this.
         // But it's not necessary now and we have to consider two audio services(client, server).
+        #[cfg(target_env = "ohos")]
+        crate::server::input_service::release_all_modifiers();
         crate::audio_service::set_voice_call_input_device(None, true);
         log::info!("#{} Connection closed: {}", self.inner.id(), reason);
         if lock

@@ -257,6 +257,51 @@ class PlatformFFI {
     keyListeners.clear();
   }
 
+  Future<List<String>> getSoundInputs() async => <String>[];
+
+  Future<void> selectSoundInput(String device) async {}
+
+  Future<bool> isWindowMaximized() async => false;
+
+  Future<void> minimizeWindow() async {}
+
+  Future<void> resizeWindow(int width, int height, {String? align}) async {}
+
+  Future<bool> toggleMaximizeWindow() async => false;
+
+  Future<void> startMovingWindow() async {}
+
+  Future<void> setKeepScreenOn(bool enabled) async {}
+
+  Future<String> getOhosDownloadDirectory() async =>
+      throw UnsupportedError('HarmonyOS Download directory is unavailable');
+
+  bool get isOhosHostCaptureRunning => false;
+
+  bool get isOhosCustomScreenRecordingGranted => false;
+
+  bool get isOhosControlDeviceGranted => false;
+
+  bool get isOhosHostInputAuthorized => false;
+
+  Future<void> syncOhosHostPermissions({bool promptIfMissing = false}) async {}
+
+  Future<bool> openSystemSettings() async => false;
+
+  Future<void> setFullscreen(bool enabled) async {}
+
+  Future<void> setLandscapeMultiWindow(bool enabled) async {}
+
+  Future<void> disableImePreviewText() async {}
+
+  Future<void> terminateWindow() async {}
+
+  Future<String> startOhosHost() async => 'OHOS host is unavailable';
+
+  Future<String> stopOhosHost() async => '';
+
+  Future<void> closeWindow() async {}
+
   void setMethodCallHandler(FMethod callback) {}
 
   invokeMethod(String method, [dynamic arguments]) async {

@@ -1039,7 +1039,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
             !outgoingOnly &&
             !hideSecuritySettings)
           SettingsSection(title: Text('2FA'), tiles: tfaTiles),
-        if (isAndroid &&
+        if ((isAndroid || isOhos) &&
             !disabledSettings &&
             !outgoingOnly &&
             !hideSecuritySettings)
@@ -1063,7 +1063,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 onPressed: (context) async {
                   await launchUrl(Uri.parse(url));
                 },
-                title: Text(translate("Version: ") + version),
+                title: Text('${translate('Version')}: $version'),
                 value: Padding(
                   padding: EdgeInsets.symmetric(vertical: 8),
                   child: Text('rustdesk.com',
